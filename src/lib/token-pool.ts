@@ -122,9 +122,10 @@ export class TokenPool {
       // Get user info
       const userResp = await fetch("https://api.github.com/user", {
         headers: {
+          accept: "application/vnd.github+json",
           authorization: `token ${entry.githubToken}`,
           "user-agent": "GitHubCopilotChat/0.46.0",
-          "x-github-api-version": "2025-10-01",
+          "x-github-api-version": "2022-11-28",
         },
       })
       if (!userResp.ok) {
@@ -140,7 +141,7 @@ export class TokenPool {
           headers: {
             authorization: `token ${entry.githubToken}`,
             "user-agent": "GitHubCopilotChat/0.46.0",
-            "x-github-api-version": "2025-10-01",
+            "x-github-api-version": "2022-11-28",
           },
         },
       )
