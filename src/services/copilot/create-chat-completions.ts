@@ -13,6 +13,7 @@ import {
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import { withPoolRelease } from "~/lib/token-pool"
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
@@ -26,57 +27,69 @@ export const createChatCompletions = async (
   if (!state.copilotToken && !state.tokenPool)
     throw new Error("Copilot token not found")
 
-  const enableVision = payload.messages.some(
-    (x) =>
-      typeof x.content !== "string"
-      && x.content?.some((x) => x.type === "image_url"),
-  )
+  const poolEntry = state.tokenPool?.acquire() ?? null
+  let streamOwnsEntry = false
+  try {
+    const enableVision = payload.messages.some(
+      (x) =>
+        typeof x.content !== "string"
+        && x.content?.some((x) => x.type === "image_url"),
+    )
 
-  // Agent/user check for x-initiator header
-  // Determine if any message is from an agent ("assistant" or "tool")
-  // Refactor `isAgentCall` logic to check only the last message in the history rather than any message. This prevents valid user messages from being incorrectly flagged as agent calls due to previous assistant history, ensuring proper credit consumption for multi-turn conversations.
-  let isAgentCall = false
-  if (payload.messages.length > 0) {
-    const lastMessage = payload.messages.at(-1)
-    if (lastMessage) {
-      isAgentCall = ["assistant", "tool"].includes(lastMessage.role)
+    let isAgentCall = false
+    if (payload.messages.length > 0) {
+      const lastMessage = payload.messages.at(-1)
+      if (lastMessage) {
+        isAgentCall = ["assistant", "tool"].includes(lastMessage.role)
+      }
+    }
+
+    const headers: Record<string, string> = {
+      ...copilotHeaders(state, options.requestId, enableVision, poolEntry ?? undefined),
+      "x-initiator": isAgentCall ? "agent" : "user",
+    }
+
+    prepareInteractionHeaders(
+      options.sessionId,
+      Boolean(options.subagentMarker),
+      headers,
+    )
+
+    prepareForCompact(headers, options.compactType)
+
+    consola.log(`<-- model: ${payload.model}`)
+
+    const response = await fetch(
+      `${copilotBaseUrl(state, poolEntry ?? undefined)}/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      },
+    )
+
+    logCopilotRateLimits(response.headers)
+
+    if (!response.ok) {
+      consola.error("Failed to create chat completions", response)
+      throw new HTTPError("Failed to create chat completions", response)
+    }
+
+    if (payload.stream) {
+      const stream = events(response)
+      if (poolEntry && state.tokenPool) {
+        streamOwnsEntry = true
+        return withPoolRelease(stream, state.tokenPool, poolEntry)
+      }
+      return stream
+    }
+
+    return (await response.json()) as ChatCompletionResponse
+  } finally {
+    if (poolEntry && !streamOwnsEntry) {
+      state.tokenPool?.release(poolEntry)
     }
   }
-
-  // Build headers and add x-initiator
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, options.requestId, enableVision),
-    "x-initiator": isAgentCall ? "agent" : "user",
-  }
-
-  prepareInteractionHeaders(
-    options.sessionId,
-    Boolean(options.subagentMarker),
-    headers,
-  )
-
-  prepareForCompact(headers, options.compactType)
-
-  consola.log(`<-- model: ${payload.model}`)
-
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
-
-  logCopilotRateLimits(response.headers)
-
-  if (!response.ok) {
-    consola.error("Failed to create chat completions", response)
-    throw new HTTPError("Failed to create chat completions", response)
-  }
-
-  if (payload.stream) {
-    return events(response)
-  }
-
-  return (await response.json()) as ChatCompletionResponse
 }
 
 // Streaming types

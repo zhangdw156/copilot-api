@@ -18,6 +18,7 @@ import {
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import { withPoolRelease } from "~/lib/token-pool"
 import { parseUserIdMetadata } from "~/lib/utils"
 
 export type MessagesStream = ReturnType<typeof events>
@@ -75,75 +76,89 @@ export const createMessages = async (
   if (!state.copilotToken && !state.tokenPool)
     throw new Error("Copilot token not found")
 
-  const enableVision = payload.messages.some((message) => {
-    if (!Array.isArray(message.content)) return false
-    return message.content.some(
-      (block) =>
-        block.type === "image"
-        || (block.type === "tool_result"
-          && Array.isArray(block.content)
-          && block.content.some((inner) => inner.type === "image")),
+  const poolEntry = state.tokenPool?.acquire() ?? null
+  let streamOwnsEntry = false
+  try {
+    const enableVision = payload.messages.some((message) => {
+      if (!Array.isArray(message.content)) return false
+      return message.content.some(
+        (block) =>
+          block.type === "image"
+          || (block.type === "tool_result"
+            && Array.isArray(block.content)
+            && block.content.some((inner) => inner.type === "image")),
+      )
+    })
+
+    let isInitiateRequest = false
+    const lastMessage = payload.messages.at(-1)
+    if (lastMessage?.role === "user") {
+      isInitiateRequest =
+        Array.isArray(lastMessage.content) ?
+          lastMessage.content.some((block) => block.type !== "tool_result")
+        : true
+    }
+
+    const headers: Record<string, string> = {
+      ...copilotHeaders(state, options.requestId, enableVision, poolEntry ?? undefined),
+      "x-initiator": isInitiateRequest ? "user" : "agent",
+    }
+
+    prepareInteractionHeaders(
+      options.sessionId,
+      Boolean(options.subagentMarker),
+      headers,
     )
-  })
 
-  let isInitiateRequest = false
-  const lastMessage = payload.messages.at(-1)
-  if (lastMessage?.role === "user") {
-    isInitiateRequest =
-      Array.isArray(lastMessage.content) ?
-        lastMessage.content.some((block) => block.type !== "tool_result")
-      : true
+    prepareForCompact(headers, options.compactType)
+
+    const { safetyIdentifier, sessionId } = parseUserIdMetadata(
+      payload.metadata?.user_id,
+    )
+    if (safetyIdentifier && sessionId) {
+      prepareMessageProxyHeaders(headers)
+    }
+
+    const anthropicBeta = buildAnthropicBetaHeader(
+      anthropicBetaHeader,
+      payload.thinking,
+      payload.model,
+    )
+    if (anthropicBeta) {
+      headers["anthropic-beta"] = anthropicBeta
+    }
+
+    consola.log(`<-- model: ${payload.model}`)
+
+    const response = await fetch(
+      `${copilotBaseUrl(state, poolEntry ?? undefined)}/v1/messages`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      },
+    )
+
+    logCopilotRateLimits(response.headers)
+
+    if (!response.ok) {
+      consola.error("Failed to create messages", response)
+      throw new HTTPError("Failed to create messages", response)
+    }
+
+    if (payload.stream) {
+      const stream = events(response)
+      if (poolEntry && state.tokenPool) {
+        streamOwnsEntry = true
+        return withPoolRelease(stream, state.tokenPool, poolEntry)
+      }
+      return stream
+    }
+
+    return (await response.json()) as AnthropicResponse
+  } finally {
+    if (poolEntry && !streamOwnsEntry) {
+      state.tokenPool?.release(poolEntry)
+    }
   }
-
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, options.requestId, enableVision),
-    "x-initiator": isInitiateRequest ? "user" : "agent",
-  }
-
-  prepareInteractionHeaders(
-    options.sessionId,
-    Boolean(options.subagentMarker),
-    headers,
-  )
-
-  prepareForCompact(headers, options.compactType)
-
-  const { safetyIdentifier, sessionId } = parseUserIdMetadata(
-    payload.metadata?.user_id,
-  )
-  // from claude code
-  if (safetyIdentifier && sessionId) {
-    prepareMessageProxyHeaders(headers)
-  }
-
-  // align with vscode copilot extension anthropic-beta
-  const anthropicBeta = buildAnthropicBetaHeader(
-    anthropicBetaHeader,
-    payload.thinking,
-    payload.model,
-  )
-  if (anthropicBeta) {
-    headers["anthropic-beta"] = anthropicBeta
-  }
-
-  consola.log(`<-- model: ${payload.model}`)
-
-  const response = await fetch(`${copilotBaseUrl(state)}/v1/messages`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
-
-  logCopilotRateLimits(response.headers)
-
-  if (!response.ok) {
-    consola.error("Failed to create messages", response)
-    throw new HTTPError("Failed to create messages", response)
-  }
-
-  if (payload.stream) {
-    return events(response)
-  }
-
-  return (await response.json()) as AnthropicResponse
 }

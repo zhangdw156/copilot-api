@@ -2,12 +2,23 @@ import { randomUUID } from "node:crypto"
 
 import { COMPACT_REQUEST, type CompactType } from "~/lib/compact"
 
+import type { TokenPoolEntry } from "./token-pool"
+
 import type { State } from "./state"
 
 import { getCachedOpencodeVersion } from "./opencode"
 import { requestContext } from "./request-context"
 
-export const getEffectiveCopilotToken = (state: State): string => {
+export const getEffectiveCopilotToken = (
+  state: State,
+  poolEntry?: TokenPoolEntry,
+): string => {
+  if (poolEntry) {
+    if (!poolEntry.copilotToken) {
+      throw new Error("Pool entry has no copilot token")
+    }
+    return poolEntry.copilotToken
+  }
   if (state.tokenPool) {
     return state.tokenPool.getCopilotToken()
   }
@@ -163,7 +174,10 @@ const CLAUDE_AGENT_USER_AGENT =
 
 const API_VERSION = "2025-10-01"
 
-export const copilotBaseUrl = (state: State) => {
+export const copilotBaseUrl = (
+  state: State,
+  poolEntry?: TokenPoolEntry,
+) => {
   const enterpriseDomain = getEnterpriseDomain()
   if (enterpriseDomain) {
     return `https://copilot-api.${enterpriseDomain}`
@@ -174,7 +188,7 @@ export const copilotBaseUrl = (state: State) => {
   }
 
   if (state.tokenPool) {
-    const poolUrl = state.tokenPool.getCopilotApiUrl()
+    const poolUrl = state.tokenPool.getCopilotApiUrl(poolEntry)
     if (poolUrl) return poolUrl
   }
 
@@ -242,9 +256,10 @@ export const copilotHeaders = (
   state: State,
   requestId?: string,
   vision: boolean = false,
+  poolEntry?: TokenPoolEntry,
 ) => {
   if (isOpencodeOauthApp()) {
-    const token = getEffectiveCopilotToken(state)
+    const token = getEffectiveCopilotToken(state, poolEntry)
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
       ...getOpencodeLLMHeaders(),
@@ -272,16 +287,17 @@ export const copilotHeaders = (
     return headers
   }
 
-  return githubCopilotHeaders(state, requestId, vision)
+  return githubCopilotHeaders(state, requestId, vision, poolEntry)
 }
 
 const githubCopilotHeaders = (
   state: State,
   requestId?: string,
   vision: boolean = false,
+  poolEntry?: TokenPoolEntry,
 ) => {
   const requestIdValue = requestId ?? randomUUID()
-  const token = getEffectiveCopilotToken(state)
+  const token = getEffectiveCopilotToken(state, poolEntry)
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     "content-type": standardHeaders()["content-type"],

@@ -13,6 +13,11 @@ import {
 import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
+import {
+  type TokenPoolEntry,
+  withPoolRelease,
+  withSessionBind,
+} from "~/lib/token-pool"
 
 export interface ResponsesPayload {
   model: string
@@ -372,6 +377,24 @@ interface ResponsesRequestOptions {
   compactType?: CompactType
 }
 
+const extractPreviousResponseId = (
+  payload: ResponsesPayload,
+): string | undefined =>
+  typeof payload.previous_response_id === "string"
+    ? payload.previous_response_id
+    : undefined
+
+const bindResponseSession = (
+  result: ResponsesResult,
+  poolEntry: TokenPoolEntry | null,
+  sessionId?: string,
+): void => {
+  if (poolEntry && state.tokenPool) {
+    if (result.id) state.tokenPool.bindSession(result.id, poolEntry)
+    if (sessionId) state.tokenPool.bindSession(sessionId, poolEntry)
+  }
+}
+
 export const createResponses = async (
   payload: ResponsesPayload,
   {
@@ -386,36 +409,62 @@ export const createResponses = async (
   if (!state.copilotToken && !state.tokenPool)
     throw new Error("Copilot token not found")
 
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, requestId, vision),
-    "x-initiator": initiator,
+  const poolEntry =
+    state.tokenPool?.acquire(
+      extractPreviousResponseId(payload) ?? sessionId,
+    ) ?? null
+  let streamOwnsEntry = false
+  try {
+    const headers: Record<string, string> = {
+      ...copilotHeaders(state, requestId, vision, poolEntry ?? undefined),
+      "x-initiator": initiator,
+    }
+
+    prepareInteractionHeaders(sessionId, Boolean(subagentMarker), headers)
+
+    prepareForCompact(headers, compactType)
+
+    // service_tier is not supported by github copilot
+    payload.service_tier = undefined
+
+    consola.log(`<-- model: ${payload.model}`)
+
+    const response = await fetch(
+      `${copilotBaseUrl(state, poolEntry ?? undefined)}/responses`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      },
+    )
+
+    logCopilotRateLimits(response.headers)
+
+    if (!response.ok) {
+      consola.error("Failed to create responses", response)
+      throw new HTTPError("Failed to create responses", response)
+    }
+
+    if (payload.stream) {
+      const stream = events(response)
+      if (poolEntry && state.tokenPool) {
+        streamOwnsEntry = true
+        return withSessionBind(
+          withPoolRelease(stream, state.tokenPool, poolEntry),
+          state.tokenPool,
+          poolEntry,
+          sessionId,
+        )
+      }
+      return stream
+    }
+
+    const result = (await response.json()) as ResponsesResult
+    bindResponseSession(result, poolEntry, sessionId)
+    return result
+  } finally {
+    if (poolEntry && !streamOwnsEntry) {
+      state.tokenPool?.release(poolEntry)
+    }
   }
-
-  prepareInteractionHeaders(sessionId, Boolean(subagentMarker), headers)
-
-  prepareForCompact(headers, compactType)
-
-  // service_tier is not supported by github copilot
-  payload.service_tier = undefined
-
-  consola.log(`<-- model: ${payload.model}`)
-
-  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
-
-  logCopilotRateLimits(response.headers)
-
-  if (!response.ok) {
-    consola.error("Failed to create responses", response)
-    throw new HTTPError("Failed to create responses", response)
-  }
-
-  if (payload.stream) {
-    return events(response)
-  }
-
-  return (await response.json()) as ResponsesResult
 }

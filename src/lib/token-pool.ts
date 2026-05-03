@@ -10,6 +10,7 @@ const EARLY_REFRESH_BUFFER_MS = 60_000
 const RETRY_REFRESH_DELAY_MS = 15_000
 const MIN_REFRESH_DELAY_MS = 1_000
 const COOLDOWN_MS = 120_000
+const SESSION_TTL_MS = 10 * 60 * 1000
 
 export interface TokenPoolEntry {
   label: string
@@ -19,11 +20,13 @@ export interface TokenPoolEntry {
   healthy: boolean
   unavailableUntil: number
   refreshController: AbortController | null
+  activeRequests: number
 }
 
 export class TokenPool {
   private entries: Array<TokenPoolEntry> = []
-  private index = 0
+  private sessionMap: Map<string, { label: string; lastAccess: number }> =
+    new Map()
 
   get size(): number {
     return this.entries.length
@@ -57,6 +60,7 @@ export class TokenPool {
         healthy: true,
         unavailableUntil: 0,
         refreshController: null,
+        activeRequests: 0,
       })
     }
 
@@ -78,22 +82,78 @@ export class TokenPool {
     )
   }
 
-  next(): TokenPoolEntry {
+  acquire(affinityKey?: string): TokenPoolEntry {
     const now = Date.now()
-    for (let i = 0; i < this.entries.length; i++) {
-      const entry = this.entries[this.index % this.entries.length]
-      this.index++
-      if (entry.healthy && entry.copilotToken) {
-        return entry
-      }
-      // Check cooldown expiry
+    // Recover entries whose cooldown has expired
+    for (const entry of this.entries) {
       if (!entry.healthy && now >= entry.unavailableUntil) {
         entry.healthy = true
-        // Re-init in background
         this.initEntry(entry).catch(() => {})
       }
     }
-    throw new Error("[pool] All credentials are unavailable")
+
+    // Session affinity: reuse the same entry for a known response chain
+    if (affinityKey) {
+      const mapping = this.sessionMap.get(affinityKey)
+      if (mapping) {
+        const entry = this.entries.find(
+          (e) => e.label === mapping.label && e.healthy && e.copilotToken,
+        )
+        if (entry) {
+          mapping.lastAccess = now
+          entry.activeRequests++
+          consola.debug(
+            `[pool] Acquired ${entry.label} via session affinity (active: ${entry.activeRequests})`,
+          )
+          return entry
+        }
+      }
+    }
+
+    // Select the healthy entry with the fewest active requests
+    let best: TokenPoolEntry | null = null
+    for (const entry of this.entries) {
+      if (entry.healthy && entry.copilotToken) {
+        if (!best || entry.activeRequests < best.activeRequests) {
+          best = entry
+        }
+      }
+    }
+    if (!best) {
+      throw new Error("[pool] All credentials are unavailable")
+    }
+    best.activeRequests++
+    consola.debug(
+      `[pool] Acquired ${best.label} (active: ${best.activeRequests})`,
+    )
+    return best
+  }
+
+  release(entry: TokenPoolEntry): void {
+    entry.activeRequests = Math.max(0, entry.activeRequests - 1)
+    consola.debug(
+      `[pool] Released ${entry.label} (active: ${entry.activeRequests})`,
+    )
+  }
+
+  bindSession(responseId: string, entry: TokenPoolEntry): void {
+    this.sessionMap.set(responseId, {
+      label: entry.label,
+      lastAccess: Date.now(),
+    })
+    this.cleanStaleSessions()
+  }
+
+  private cleanStaleSessions(): void {
+    const cutoff = Date.now() - SESSION_TTL_MS
+    for (const [key, val] of this.sessionMap) {
+      if (val.lastAccess < cutoff) this.sessionMap.delete(key)
+    }
+  }
+
+  /** @deprecated Use acquire()/release() for proper concurrency tracking */
+  next(): TokenPoolEntry {
+    return this.acquire()
   }
 
   getCopilotToken(): string {
@@ -104,10 +164,13 @@ export class TokenPool {
     return entry.copilotToken
   }
 
-  getCopilotApiUrl(): string | null {
-    // Use the last selected entry's URL
-    const idx = (this.index - 1 + this.entries.length) % this.entries.length
-    return this.entries[idx].copilotApiUrl
+  getCopilotApiUrl(entry?: TokenPoolEntry): string | null {
+    if (entry) {
+      return entry.copilotApiUrl
+    }
+    // Fallback: return the first healthy entry's URL
+    const healthy = this.entries.find((e) => e.healthy && e.copilotToken)
+    return healthy?.copilotApiUrl ?? null
   }
 
   stop(): void {
@@ -231,6 +294,48 @@ export class TokenPool {
         refreshAtMs = Date.now() + RETRY_REFRESH_DELAY_MS
       }
     }
+  }
+}
+
+export async function* withPoolRelease<T>(
+  stream: AsyncIterable<T>,
+  pool: TokenPool,
+  entry: TokenPoolEntry,
+): AsyncGenerator<T> {
+  try {
+    yield* stream
+  } finally {
+    pool.release(entry)
+  }
+}
+
+export async function* withSessionBind<
+  T extends { event?: string; data?: string },
+>(
+  stream: AsyncIterable<T>,
+  pool: TokenPool,
+  entry: TokenPoolEntry,
+  sessionId?: string,
+): AsyncGenerator<T> {
+  if (sessionId) {
+    pool.bindSession(sessionId, entry)
+  }
+  let bound = false
+  for await (const chunk of stream) {
+    if (!bound && chunk.event === "response.created" && chunk.data) {
+      try {
+        const parsed = JSON.parse(chunk.data) as {
+          response?: { id?: string }
+        }
+        if (parsed.response?.id) {
+          pool.bindSession(parsed.response.id, entry)
+          bound = true
+        }
+      } catch {
+        // ignore parse errors
+      }
+    }
+    yield chunk
   }
 }
 

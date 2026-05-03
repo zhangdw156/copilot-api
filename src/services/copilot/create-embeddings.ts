@@ -6,15 +6,26 @@ export const createEmbeddings = async (payload: EmbeddingRequest) => {
   if (!state.copilotToken && !state.tokenPool)
     throw new Error("Copilot token not found")
 
-  const response = await fetch(`${copilotBaseUrl(state)}/embeddings`, {
-    method: "POST",
-    headers: copilotHeaders(state),
-    body: JSON.stringify(payload),
-  })
+  const poolEntry = state.tokenPool?.acquire() ?? null
+  try {
+    const response = await fetch(
+      `${copilotBaseUrl(state, poolEntry ?? undefined)}/embeddings`,
+      {
+        method: "POST",
+        headers: copilotHeaders(state, undefined, false, poolEntry ?? undefined),
+        body: JSON.stringify(payload),
+      },
+    )
 
-  if (!response.ok) throw new HTTPError("Failed to create embeddings", response)
+    if (!response.ok)
+      throw new HTTPError("Failed to create embeddings", response)
 
-  return (await response.json()) as EmbeddingResponse
+    return (await response.json()) as EmbeddingResponse
+  } finally {
+    if (poolEntry) {
+      state.tokenPool?.release(poolEntry)
+    }
+  }
 }
 
 export interface EmbeddingRequest {
