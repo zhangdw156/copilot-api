@@ -37,8 +37,10 @@ interface RunServerOptions {
 }
 
 async function setupTokens(options: RunServerOptions): Promise<void> {
-  if (options.poolConfig) {
-    const tokenPaths = await loadPoolConfig(options.poolConfig)
+  const poolConfigPath =
+    options.poolConfig || process.env.COPILOT_API_POOL_CONFIG
+  if (poolConfigPath) {
+    const tokenPaths = await loadPoolConfig(poolConfigPath)
     const pool = new TokenPool()
     await pool.init(tokenPaths)
     state.tokenPool = pool
