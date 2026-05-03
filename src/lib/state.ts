@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto"
 
+import type { TokenPool } from "~/lib/token-pool"
 import type { ModelsResponse } from "~/services/copilot/get-models"
 
 export interface State {
   githubToken?: string
   userName?: string
   copilotToken?: string
+
+  tokenPool?: TokenPool
 
   accountType: string
   models?: ModelsResponse

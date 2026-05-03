@@ -7,6 +7,16 @@ import type { State } from "./state"
 import { getCachedOpencodeVersion } from "./opencode"
 import { requestContext } from "./request-context"
 
+export const getEffectiveCopilotToken = (state: State): string => {
+  if (state.tokenPool) {
+    return state.tokenPool.getCopilotToken()
+  }
+  if (!state.copilotToken) {
+    throw new Error("Copilot token not found")
+  }
+  return state.copilotToken
+}
+
 export const isOpencodeOauthApp = (): boolean => {
   return process.env.COPILOT_API_OAUTH_APP?.trim() === "opencode"
 }
@@ -163,6 +173,11 @@ export const copilotBaseUrl = (state: State) => {
     return "https://api.githubcopilot.com"
   }
 
+  if (state.tokenPool) {
+    const poolUrl = state.tokenPool.getCopilotApiUrl()
+    if (poolUrl) return poolUrl
+  }
+
   if (state.copilotApiUrl) {
     return state.copilotApiUrl
   }
@@ -209,8 +224,9 @@ export const githubUserHeaders = (state: State): Record<string, string> => {
 
 export const copilotModelsHeaders = (state: State) => {
   if (isOpencodeOauthApp()) {
+    const token = getEffectiveCopilotToken(state)
     return {
-      Authorization: `Bearer ${state.copilotToken}`,
+      Authorization: `Bearer ${token}`,
       "User-Agent": getOpencodeVersion(),
     }
   }
@@ -228,8 +244,9 @@ export const copilotHeaders = (
   vision: boolean = false,
 ) => {
   if (isOpencodeOauthApp()) {
+    const token = getEffectiveCopilotToken(state)
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${state.copilotToken}`,
+      Authorization: `Bearer ${token}`,
       ...getOpencodeLLMHeaders(),
       "Openai-Intent": "conversation-edits",
     }
@@ -264,8 +281,9 @@ const githubCopilotHeaders = (
   vision: boolean = false,
 ) => {
   const requestIdValue = requestId ?? randomUUID()
+  const token = getEffectiveCopilotToken(state)
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${state.copilotToken}`,
+    Authorization: `Bearer ${token}`,
     "content-type": standardHeaders()["content-type"],
     "copilot-integration-id": "vscode-chat",
     "editor-device-id": state.vsCodeDeviceId,

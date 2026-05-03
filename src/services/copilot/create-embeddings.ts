@@ -3,7 +3,8 @@ import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
 export const createEmbeddings = async (payload: EmbeddingRequest) => {
-  if (!state.copilotToken) throw new Error("Copilot token not found")
+  if (!state.copilotToken && !state.tokenPool)
+    throw new Error("Copilot token not found")
 
   const response = await fetch(`${copilotBaseUrl(state)}/embeddings`, {
     method: "POST",

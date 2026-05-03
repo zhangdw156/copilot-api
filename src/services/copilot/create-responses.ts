@@ -383,7 +383,8 @@ export const createResponses = async (
     compactType,
   }: ResponsesRequestOptions,
 ): Promise<CreateResponsesReturn> => {
-  if (!state.copilotToken) throw new Error("Copilot token not found")
+  if (!state.copilotToken && !state.tokenPool)
+    throw new Error("Copilot token not found")
 
   const headers: Record<string, string> = {
     ...copilotHeaders(state, requestId, vision),

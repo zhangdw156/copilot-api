@@ -23,7 +23,8 @@ export const createChatCompletions = async (
     compactType?: CompactType
   },
 ) => {
-  if (!state.copilotToken) throw new Error("Copilot token not found")
+  if (!state.copilotToken && !state.tokenPool)
+    throw new Error("Copilot token not found")
 
   const enableVision = payload.messages.some(
     (x) =>

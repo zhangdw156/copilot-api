@@ -72,7 +72,8 @@ export const createMessages = async (
     compactType?: CompactType
   },
 ): Promise<CreateMessagesReturn> => {
-  if (!state.copilotToken) throw new Error("Copilot token not found")
+  if (!state.copilotToken && !state.tokenPool)
+    throw new Error("Copilot token not found")
 
   const enableVision = payload.messages.some((message) => {
     if (!Array.isArray(message.content)) return false

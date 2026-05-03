@@ -13,6 +13,7 @@ import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import { logUser, setupCopilotToken, setupGitHubToken } from "./lib/token"
+import { TokenPool, loadPoolConfig } from "./lib/token-pool"
 import {
   cacheMacMachineId,
   cacheModels,
@@ -32,6 +33,27 @@ interface RunServerOptions {
   claudeCode: boolean
   showToken: boolean
   proxyEnv: boolean
+  poolConfig?: string
+}
+
+async function setupTokens(options: RunServerOptions): Promise<void> {
+  if (options.poolConfig) {
+    const tokenPaths = await loadPoolConfig(options.poolConfig)
+    const pool = new TokenPool()
+    await pool.init(tokenPaths)
+    state.tokenPool = pool
+    consola.info(
+      `[pool] Token pool active with ${pool.healthyCount} credentials`,
+    )
+  } else if (options.githubToken) {
+    state.githubToken = options.githubToken
+    consola.info("Using provided GitHub token")
+    await logUser()
+    await setupCopilotToken()
+  } else {
+    await setupGitHubToken()
+    await setupCopilotToken()
+  }
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
@@ -69,15 +91,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   cacheVsCodeSessionId()
   await cacheVsCodeDeviceId()
 
-  if (options.githubToken) {
-    state.githubToken = options.githubToken
-    consola.info("Using provided GitHub token")
-    await logUser()
-  } else {
-    await setupGitHubToken()
-  }
-
-  await setupCopilotToken()
+  await setupTokens(options)
   await cacheModels()
 
   consola.info(
@@ -218,6 +232,11 @@ export const start = defineCommand({
       default: false,
       description: "Initialize proxy from environment variables",
     },
+    "pool-config": {
+      type: "string",
+      description:
+        "Path to copilot_pool.yaml with multiple GitHub token paths for round-robin",
+    },
   },
   run({ args }) {
     const rateLimitRaw = args["rate-limit"]
@@ -236,6 +255,7 @@ export const start = defineCommand({
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
+      poolConfig: args["pool-config"],
     })
   },
 })
