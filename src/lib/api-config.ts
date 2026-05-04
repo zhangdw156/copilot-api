@@ -9,10 +9,10 @@ import type { State } from "./state"
 import { getCachedOpencodeVersion } from "./opencode"
 import { requestContext } from "./request-context"
 
-export const getEffectiveCopilotToken = (
+export const getEffectiveCopilotToken = async (
   state: State,
   poolEntry?: TokenPoolEntry,
-): string => {
+): Promise<string> => {
   if (poolEntry) {
     if (!poolEntry.copilotToken) {
       throw new Error("Pool entry has no copilot token")
@@ -20,7 +20,7 @@ export const getEffectiveCopilotToken = (
     return poolEntry.copilotToken
   }
   if (state.tokenPool) {
-    return state.tokenPool.getCopilotToken()
+    return await state.tokenPool.getCopilotToken()
   }
   if (!state.copilotToken) {
     throw new Error("Copilot token not found")
@@ -236,15 +236,15 @@ export const githubUserHeaders = (state: State): Record<string, string> => {
   }
 }
 
-export const copilotModelsHeaders = (state: State) => {
+export const copilotModelsHeaders = async (state: State) => {
   if (isOpencodeOauthApp()) {
-    const token = getEffectiveCopilotToken(state)
+    const token = await getEffectiveCopilotToken(state)
     return {
       Authorization: `Bearer ${token}`,
       "User-Agent": getOpencodeVersion(),
     }
   }
-  const headers = githubCopilotHeaders(state)
+  const headers = await githubCopilotHeaders(state)
   headers["x-interaction-type"] = "model-access"
   headers["openai-intent"] = "model-access"
   delete headers["x-interaction-id"]
@@ -252,14 +252,14 @@ export const copilotModelsHeaders = (state: State) => {
   return headers
 }
 
-export const copilotHeaders = (
+export const copilotHeaders = async (
   state: State,
   requestId?: string,
   vision: boolean = false,
   poolEntry?: TokenPoolEntry,
 ) => {
   if (isOpencodeOauthApp()) {
-    const token = getEffectiveCopilotToken(state, poolEntry)
+    const token = await getEffectiveCopilotToken(state, poolEntry)
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
       ...getOpencodeLLMHeaders(),
@@ -287,17 +287,17 @@ export const copilotHeaders = (
     return headers
   }
 
-  return githubCopilotHeaders(state, requestId, vision, poolEntry)
+  return await githubCopilotHeaders(state, requestId, vision, poolEntry)
 }
 
-const githubCopilotHeaders = (
+const githubCopilotHeaders = async (
   state: State,
   requestId?: string,
   vision: boolean = false,
   poolEntry?: TokenPoolEntry,
 ) => {
   const requestIdValue = requestId ?? randomUUID()
-  const token = getEffectiveCopilotToken(state, poolEntry)
+  const token = await getEffectiveCopilotToken(state, poolEntry)
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     "content-type": standardHeaders()["content-type"],

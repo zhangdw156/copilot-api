@@ -10,6 +10,10 @@ const EARLY_REFRESH_BUFFER_MS = 60_000
 const RETRY_REFRESH_DELAY_MS = 15_000
 const MIN_REFRESH_DELAY_MS = 1_000
 const COOLDOWN_MS = 120_000
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000
+const MAX_CONCURRENT_PER_ENTRY = 8
+const ACQUIRE_POLL_MS = 500
+const ACQUIRE_TIMEOUT_MS = 120_000
 const SESSION_TTL_MS = 10 * 60 * 1000
 
 export interface TokenPoolEntry {
@@ -82,57 +86,85 @@ export class TokenPool {
     )
   }
 
-  acquire(affinityKey?: string): TokenPoolEntry {
-    const now = Date.now()
-    // Recover entries whose cooldown has expired
-    for (const entry of this.entries) {
-      if (!entry.healthy && now >= entry.unavailableUntil) {
-        entry.healthy = true
-        this.initEntry(entry).catch(() => {})
-      }
-    }
+  async acquire(affinityKey?: string): Promise<TokenPoolEntry> {
+    const deadline = Date.now() + ACQUIRE_TIMEOUT_MS
 
-    // Session affinity: reuse the same entry for a known response chain
-    if (affinityKey) {
-      const mapping = this.sessionMap.get(affinityKey)
-      if (mapping) {
-        const entry = this.entries.find(
-          (e) => e.label === mapping.label && e.healthy && e.copilotToken,
-        )
-        if (entry) {
-          mapping.lastAccess = now
-          entry.activeRequests++
-          consola.debug(
-            `[pool] Acquired ${entry.label} via session affinity (active: ${entry.activeRequests})`,
+    while (true) {
+      const now = Date.now()
+      // Recover entries whose cooldown has expired
+      for (const entry of this.entries) {
+        if (!entry.healthy && now >= entry.unavailableUntil) {
+          entry.healthy = true
+          this.initEntry(entry).catch(() => {})
+        }
+      }
+
+      // Session affinity: reuse the same entry for a known response chain
+      if (affinityKey) {
+        const mapping = this.sessionMap.get(affinityKey)
+        if (mapping) {
+          const entry = this.entries.find(
+            (e) =>
+              e.label === mapping.label
+              && e.healthy
+              && e.copilotToken
+              && e.activeRequests < MAX_CONCURRENT_PER_ENTRY,
           )
-          return entry
+          if (entry) {
+            mapping.lastAccess = now
+            entry.activeRequests++
+            consola.debug(
+              `[pool] Acquired ${entry.label} via session affinity (active: ${entry.activeRequests})`,
+            )
+            return entry
+          }
         }
       }
-    }
 
-    // Select the healthy entry with the fewest active requests
-    let best: TokenPoolEntry | null = null
-    for (const entry of this.entries) {
-      if (entry.healthy && entry.copilotToken) {
-        if (!best || entry.activeRequests < best.activeRequests) {
-          best = entry
+      // Select the healthy entry with the fewest active requests under the cap
+      let best: TokenPoolEntry | null = null
+      for (const entry of this.entries) {
+        if (
+          entry.healthy
+          && entry.copilotToken
+          && entry.activeRequests < MAX_CONCURRENT_PER_ENTRY
+        ) {
+          if (!best || entry.activeRequests < best.activeRequests) {
+            best = entry
+          }
         }
       }
+
+      if (best) {
+        best.activeRequests++
+        consola.debug(
+          `[pool] Acquired ${best.label} (active: ${best.activeRequests})`,
+        )
+        return best
+      }
+
+      // All entries at capacity or unavailable — wait and retry
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `[pool] All credentials are at max concurrency (${MAX_CONCURRENT_PER_ENTRY}) or unavailable`,
+        )
+      }
+      await delay(ACQUIRE_POLL_MS)
     }
-    if (!best) {
-      throw new Error("[pool] All credentials are unavailable")
-    }
-    best.activeRequests++
-    consola.debug(
-      `[pool] Acquired ${best.label} (active: ${best.activeRequests})`,
-    )
-    return best
   }
 
   release(entry: TokenPoolEntry): void {
     entry.activeRequests = Math.max(0, entry.activeRequests - 1)
     consola.debug(
       `[pool] Released ${entry.label} (active: ${entry.activeRequests})`,
+    )
+  }
+
+  markRateLimited(entry: TokenPoolEntry): void {
+    entry.healthy = false
+    entry.unavailableUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS
+    consola.warn(
+      `[pool:${entry.label}] Rate limited — disabled for ${RATE_LIMIT_COOLDOWN_MS / 60000} min`,
     )
   }
 
@@ -152,12 +184,12 @@ export class TokenPool {
   }
 
   /** @deprecated Use acquire()/release() for proper concurrency tracking */
-  next(): TokenPoolEntry {
+  async next(): Promise<TokenPoolEntry> {
     return this.acquire()
   }
 
-  getCopilotToken(): string {
-    const entry = this.next()
+  async getCopilotToken(): Promise<string> {
+    const entry = await this.next()
     if (!entry.copilotToken) {
       throw new Error("[pool] Selected entry has no copilot token")
     }

@@ -76,7 +76,7 @@ export const createMessages = async (
   if (!state.copilotToken && !state.tokenPool)
     throw new Error("Copilot token not found")
 
-  const poolEntry = state.tokenPool?.acquire() ?? null
+  const poolEntry = (await state.tokenPool?.acquire()) ?? null
   let streamOwnsEntry = false
   try {
     const enableVision = payload.messages.some((message) => {
@@ -100,7 +100,7 @@ export const createMessages = async (
     }
 
     const headers: Record<string, string> = {
-      ...copilotHeaders(state, options.requestId, enableVision, poolEntry ?? undefined),
+      ...await copilotHeaders(state, options.requestId, enableVision, poolEntry ?? undefined),
       "x-initiator": isInitiateRequest ? "user" : "agent",
     }
 
@@ -142,6 +142,10 @@ export const createMessages = async (
     logCopilotRateLimits(response.headers)
 
     if (!response.ok) {
+      if (poolEntry && response.status === 429 && state.tokenPool) {
+        consola.error(`[pool:${poolEntry.label}] 429 rate limited`)
+        state.tokenPool.markRateLimited(poolEntry)
+      }
       consola.error("Failed to create messages", response)
       throw new HTTPError("Failed to create messages", response)
     }

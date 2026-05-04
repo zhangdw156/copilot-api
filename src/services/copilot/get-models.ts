@@ -7,7 +7,7 @@ import { state } from "~/lib/state"
 export const getModels = async () => {
   consola.info(`Fetching models from ${copilotBaseUrl(state)}/models`)
   const response = await fetch(`${copilotBaseUrl(state)}/models`, {
-    headers: copilotModelsHeaders(state),
+    headers: await copilotModelsHeaders(state),
   })
 
   if (!response.ok) {

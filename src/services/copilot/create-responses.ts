@@ -410,13 +410,13 @@ export const createResponses = async (
     throw new Error("Copilot token not found")
 
   const poolEntry =
-    state.tokenPool?.acquire(
+    (await state.tokenPool?.acquire(
       extractPreviousResponseId(payload) ?? sessionId,
-    ) ?? null
+    )) ?? null
   let streamOwnsEntry = false
   try {
     const headers: Record<string, string> = {
-      ...copilotHeaders(state, requestId, vision, poolEntry ?? undefined),
+      ...await copilotHeaders(state, requestId, vision, poolEntry ?? undefined),
       "x-initiator": initiator,
     }
 
@@ -441,6 +441,10 @@ export const createResponses = async (
     logCopilotRateLimits(response.headers)
 
     if (!response.ok) {
+      if (poolEntry && response.status === 429 && state.tokenPool) {
+        consola.error(`[pool:${poolEntry.label}] 429 rate limited`)
+        state.tokenPool.markRateLimited(poolEntry)
+      }
       consola.error("Failed to create responses", response)
       throw new HTTPError("Failed to create responses", response)
     }
