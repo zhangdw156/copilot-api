@@ -380,9 +380,9 @@ interface ResponsesRequestOptions {
 const extractPreviousResponseId = (
   payload: ResponsesPayload,
 ): string | undefined =>
-  typeof payload.previous_response_id === "string"
-    ? payload.previous_response_id
-    : undefined
+  typeof payload.previous_response_id === "string" ?
+    payload.previous_response_id
+  : undefined
 
 const bindResponseSession = (
   result: ResponsesResult,
@@ -393,6 +393,38 @@ const bindResponseSession = (
     if (result.id) state.tokenPool.bindSession(result.id, poolEntry)
     if (sessionId) state.tokenPool.bindSession(sessionId, poolEntry)
   }
+}
+
+const fetchResponses = async (
+  payload: ResponsesPayload,
+  headers: Record<string, string>,
+  poolEntry: TokenPoolEntry | null,
+): Promise<Response> => {
+  payload.service_tier = undefined
+
+  consola.log(`<-- model: ${payload.model}`)
+
+  const response = await fetch(
+    `${copilotBaseUrl(state, poolEntry ?? undefined)}/responses`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    },
+  )
+
+  logCopilotRateLimits(response.headers)
+
+  if (!response.ok) {
+    if (poolEntry && response.status === 429 && state.tokenPool) {
+      consola.error(`[pool:${poolEntry.label}] 429 rate limited`)
+      state.tokenPool.markRateLimited(poolEntry)
+    }
+    consola.error("Failed to create responses", response)
+    throw new HTTPError("Failed to create responses", response)
+  }
+
+  return response
 }
 
 export const createResponses = async (
@@ -416,7 +448,12 @@ export const createResponses = async (
   let streamOwnsEntry = false
   try {
     const headers: Record<string, string> = {
-      ...await copilotHeaders(state, requestId, vision, poolEntry ?? undefined),
+      ...(await copilotHeaders(
+        state,
+        requestId,
+        vision,
+        poolEntry ?? undefined,
+      )),
       "x-initiator": initiator,
     }
 
@@ -424,30 +461,7 @@ export const createResponses = async (
 
     prepareForCompact(headers, compactType)
 
-    // service_tier is not supported by github copilot
-    payload.service_tier = undefined
-
-    consola.log(`<-- model: ${payload.model}`)
-
-    const response = await fetch(
-      `${copilotBaseUrl(state, poolEntry ?? undefined)}/responses`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-      },
-    )
-
-    logCopilotRateLimits(response.headers)
-
-    if (!response.ok) {
-      if (poolEntry && response.status === 429 && state.tokenPool) {
-        consola.error(`[pool:${poolEntry.label}] 429 rate limited`)
-        state.tokenPool.markRateLimited(poolEntry)
-      }
-      consola.error("Failed to create responses", response)
-      throw new HTTPError("Failed to create responses", response)
-    }
+    const response = await fetchResponses(payload, headers, poolEntry)
 
     if (payload.stream) {
       const stream = events(response)
@@ -456,8 +470,7 @@ export const createResponses = async (
         return withSessionBind(
           withPoolRelease(stream, state.tokenPool, poolEntry),
           state.tokenPool,
-          poolEntry,
-          sessionId,
+          { entry: poolEntry, sessionId },
         )
       }
       return stream

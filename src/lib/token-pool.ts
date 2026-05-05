@@ -13,7 +13,7 @@ const COOLDOWN_MS = 120_000
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000
 const MAX_CONCURRENT_PER_ENTRY = 8
 const ACQUIRE_POLL_MS = 500
-const ACQUIRE_TIMEOUT_MS = 120_000
+const ACQUIRE_TIMEOUT_MS = 600_000
 const SESSION_TTL_MS = 10 * 60 * 1000
 
 export interface TokenPoolEntry {
@@ -128,10 +128,9 @@ export class TokenPool {
           entry.healthy
           && entry.copilotToken
           && entry.activeRequests < MAX_CONCURRENT_PER_ENTRY
+          && (!best || entry.activeRequests < best.activeRequests)
         ) {
-          if (!best || entry.activeRequests < best.activeRequests) {
-            best = entry
-          }
+          best = entry
         }
       }
 
@@ -189,7 +188,7 @@ export class TokenPool {
   }
 
   async getCopilotToken(): Promise<string> {
-    const entry = await this.next()
+    const entry = await this.acquire()
     if (!entry.copilotToken) {
       throw new Error("[pool] Selected entry has no copilot token")
     }
@@ -346,11 +345,10 @@ export async function* withSessionBind<
 >(
   stream: AsyncIterable<T>,
   pool: TokenPool,
-  entry: TokenPoolEntry,
-  sessionId?: string,
+  opts: { entry: TokenPoolEntry; sessionId?: string },
 ): AsyncGenerator<T> {
-  if (sessionId) {
-    pool.bindSession(sessionId, entry)
+  if (opts.sessionId) {
+    pool.bindSession(opts.sessionId, opts.entry)
   }
   let bound = false
   for await (const chunk of stream) {
@@ -360,7 +358,7 @@ export async function* withSessionBind<
           response?: { id?: string }
         }
         if (parsed.response?.id) {
-          pool.bindSession(parsed.response.id, entry)
+          pool.bindSession(parsed.response.id, opts.entry)
           bound = true
         }
       } catch {
