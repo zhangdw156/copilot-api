@@ -377,12 +377,25 @@ interface ResponsesRequestOptions {
   compactType?: CompactType
 }
 
-const extractPreviousResponseId = (
+const extractAffinityKeys = (
   payload: ResponsesPayload,
-): string | undefined =>
-  typeof payload.previous_response_id === "string" ?
-    payload.previous_response_id
-  : undefined
+  sessionId?: string,
+): Array<string> => {
+  const keys: Array<string> = []
+  if (typeof payload.previous_response_id === "string") {
+    keys.push(payload.previous_response_id)
+  }
+  if (Array.isArray(payload.input)) {
+    for (const item of payload.input) {
+      if (typeof item === "object") {
+        const id = (item as { id?: unknown }).id
+        if (typeof id === "string" && id.length > 0) keys.push(id)
+      }
+    }
+  }
+  if (sessionId) keys.push(sessionId)
+  return keys
+}
 
 const bindResponseSession = (
   result: ResponsesResult,
@@ -392,6 +405,14 @@ const bindResponseSession = (
   if (poolEntry && state.tokenPool) {
     if (result.id) state.tokenPool.bindSession(result.id, poolEntry)
     if (sessionId) state.tokenPool.bindSession(sessionId, poolEntry)
+    if (Array.isArray(result.output)) {
+      for (const item of result.output) {
+        const id = (item as { id?: unknown }).id
+        if (typeof id === "string" && id.length > 0) {
+          state.tokenPool.bindSession(id, poolEntry)
+        }
+      }
+    }
   }
 }
 
@@ -402,7 +423,9 @@ const fetchResponses = async (
 ): Promise<Response> => {
   payload.service_tier = undefined
 
-  consola.log(`<-- model: ${payload.model}`)
+  consola.log(
+    `<-- model: ${payload.model} (entry: ${poolEntry?.label ?? "n/a"}, prev_id: ${typeof payload.previous_response_id === "string" ? payload.previous_response_id.slice(0, 24) : "none"})`,
+  )
 
   const response = await fetch(
     `${copilotBaseUrl(state, poolEntry ?? undefined)}/responses`,
@@ -420,7 +443,9 @@ const fetchResponses = async (
       consola.error(`[pool:${poolEntry.label}] 429 rate limited`)
       state.tokenPool.markRateLimited(poolEntry)
     }
-    consola.error("Failed to create responses", response)
+    consola.error(
+      `[pool:${poolEntry?.label ?? "n/a"}] upstream HTTP ${response.status} for model ${payload.model}`,
+    )
     throw new HTTPError("Failed to create responses", response)
   }
 
@@ -442,9 +467,8 @@ export const createResponses = async (
     throw new Error("Copilot token not found")
 
   const poolEntry =
-    (await state.tokenPool?.acquire(
-      extractPreviousResponseId(payload) ?? sessionId,
-    )) ?? null
+    (await state.tokenPool?.acquire(extractAffinityKeys(payload, sessionId)))
+    ?? null
   let streamOwnsEntry = false
   try {
     const headers: Record<string, string> = {

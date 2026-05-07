@@ -86,63 +86,141 @@ export class TokenPool {
     )
   }
 
-  async acquire(affinityKey?: string): Promise<TokenPoolEntry> {
+  private normalizeAffinityKeys(
+    affinityKeys: string | Iterable<string | undefined> | undefined,
+  ): Array<string> {
+    const keys: Array<string> = []
+    if (typeof affinityKeys === "string") {
+      if (affinityKeys.length > 0) keys.push(affinityKeys)
+    } else if (affinityKeys) {
+      for (const k of affinityKeys) {
+        if (typeof k === "string" && k.length > 0) keys.push(k)
+      }
+    }
+    return keys
+  }
+
+  private resolveBoundLabel(candidateKeys: Array<string>): string | null {
+    const now = Date.now()
+    for (const key of candidateKeys) {
+      const mapping = this.sessionMap.get(key)
+      if (mapping) {
+        mapping.lastAccess = now
+        return mapping.label
+      }
+    }
+    return null
+  }
+
+  private recoverExpiredEntries(now: number): void {
+    for (const entry of this.entries) {
+      if (!entry.healthy && now >= entry.unavailableUntil) {
+        entry.healthy = true
+        this.initEntry(entry).catch(() => {})
+      }
+    }
+  }
+
+  private tryAcquireBound(label: string): TokenPoolEntry | null | undefined {
+    // null = entry vanished, undefined = entry exists but not yet usable
+    const entry = this.entries.find((e) => e.label === label)
+    if (!entry) return null
+    if (
+      entry.healthy
+      && entry.copilotToken
+      && entry.activeRequests < MAX_CONCURRENT_PER_ENTRY
+    ) {
+      entry.activeRequests++
+      consola.info(
+        `[pool] Acquired ${entry.label} via session affinity (active: ${entry.activeRequests})`,
+      )
+      return entry
+    }
+    return undefined
+  }
+
+  private pickLeastBusy(): TokenPoolEntry | null {
+    let best: TokenPoolEntry | null = null
+    for (const entry of this.entries) {
+      if (
+        entry.healthy
+        && entry.copilotToken
+        && entry.activeRequests < MAX_CONCURRENT_PER_ENTRY
+        && (!best || entry.activeRequests < best.activeRequests)
+      ) {
+        best = entry
+      }
+    }
+    return best
+  }
+
+  async acquire(
+    affinityKeys?: string | Iterable<string | undefined>,
+  ): Promise<TokenPoolEntry> {
     const deadline = Date.now() + ACQUIRE_TIMEOUT_MS
+    const candidateKeys = this.normalizeAffinityKeys(affinityKeys)
+    let boundLabel: string | null = null
+    let logged = false
 
     while (true) {
-      const now = Date.now()
-      // Recover entries whose cooldown has expired
-      for (const entry of this.entries) {
-        if (!entry.healthy && now >= entry.unavailableUntil) {
-          entry.healthy = true
-          this.initEntry(entry).catch(() => {})
-        }
-      }
+      this.recoverExpiredEntries(Date.now())
 
-      // Session affinity: reuse the same entry for a known response chain
-      if (affinityKey) {
-        const mapping = this.sessionMap.get(affinityKey)
-        if (mapping) {
-          const entry = this.entries.find(
-            (e) =>
-              e.label === mapping.label
-              && e.healthy
-              && e.copilotToken
-              && e.activeRequests < MAX_CONCURRENT_PER_ENTRY,
+      // Resolve affinity binding once per acquire — keep waiting for that
+      // specific entry rather than falling back to a different account, since
+      // Copilot rejects cross-account input items with
+      // "input item does not belong to this connection".
+      if (boundLabel === null && candidateKeys.length > 0) {
+        boundLabel = this.resolveBoundLabel(candidateKeys)
+        if (!logged && boundLabel === null) {
+          // Only warn for keys that imply a prior response chain
+          // (resp_/rs_/msg_/fc_). Plain client session UUIDs are bound on
+          // first use; missing them is normal for a chain's first request.
+          const riskyKey = candidateKeys.find((k) =>
+            /^(?:resp|rs|msg|fc)_/.test(k),
           )
-          if (entry) {
-            mapping.lastAccess = now
-            entry.activeRequests++
-            consola.debug(
-              `[pool] Acquired ${entry.label} via session affinity (active: ${entry.activeRequests})`,
+          if (riskyKey) {
+            consola.warn(
+              `[pool] No affinity match for response-chain key ${riskyKey.slice(0, 32)}… (sessionMap=${this.sessionMap.size})`,
             )
-            return entry
           }
+          logged = true
         }
       }
 
-      // Select the healthy entry with the fewest active requests under the cap
-      let best: TokenPoolEntry | null = null
-      for (const entry of this.entries) {
-        if (
-          entry.healthy
-          && entry.copilotToken
-          && entry.activeRequests < MAX_CONCURRENT_PER_ENTRY
-          && (!best || entry.activeRequests < best.activeRequests)
-        ) {
-          best = entry
+      if (boundLabel !== null) {
+        const acquired = this.tryAcquireBound(boundLabel)
+        if (acquired) return acquired
+        if (acquired === null) {
+          boundLabel = null // entry vanished — fall through to load balancer
+        } else {
+          if (Date.now() >= deadline) {
+            throw new Error(
+              `[pool] Session-bound entry ${boundLabel} unavailable`,
+            )
+          }
+          await delay(ACQUIRE_POLL_MS)
+          continue
         }
       }
 
+      const best = this.pickLeastBusy()
       if (best) {
         best.activeRequests++
-        consola.debug(
-          `[pool] Acquired ${best.label} (active: ${best.activeRequests})`,
+        const riskyKey = candidateKeys.find((k) =>
+          /^(?:resp|rs|msg|fc)_/.test(k),
         )
+        if (riskyKey) {
+          consola.warn(
+            `[pool] Load-balanced ${best.label} despite response-chain key ${riskyKey.slice(0, 32)}… — likely "does not belong" risk`,
+          )
+        } else {
+          consola.info(
+            `[pool] Acquired ${best.label} (active: ${best.activeRequests})`,
+          )
+        }
         return best
       }
 
-      // All entries at capacity or unavailable — wait and retry
       if (Date.now() >= deadline) {
         throw new Error(
           `[pool] All credentials are at max concurrency (${MAX_CONCURRENT_PER_ENTRY}) or unavailable`,
@@ -340,6 +418,19 @@ export async function* withPoolRelease<T>(
   }
 }
 
+function tryParseId(data: string, path: "response" | "item"): string | null {
+  try {
+    const parsed = JSON.parse(data) as Record<
+      string,
+      { id?: string } | undefined
+    >
+    const id = parsed[path]?.id
+    return typeof id === "string" && id.length > 0 ? id : null
+  } catch {
+    return null
+  }
+}
+
 export async function* withSessionBind<
   T extends { event?: string; data?: string },
 >(
@@ -352,17 +443,19 @@ export async function* withSessionBind<
   }
   let bound = false
   for await (const chunk of stream) {
-    if (!bound && chunk.event === "response.created" && chunk.data) {
-      try {
-        const parsed = JSON.parse(chunk.data) as {
-          response?: { id?: string }
-        }
-        if (parsed.response?.id) {
-          pool.bindSession(parsed.response.id, opts.entry)
+    if (chunk.data && chunk.event) {
+      if (!bound && chunk.event === "response.created") {
+        const id = tryParseId(chunk.data, "response")
+        if (id) {
+          pool.bindSession(id, opts.entry)
           bound = true
         }
-      } catch {
-        // ignore parse errors
+      } else if (
+        chunk.event === "response.output_item.added"
+        || chunk.event === "response.output_item.done"
+      ) {
+        const id = tryParseId(chunk.data, "item")
+        if (id) pool.bindSession(id, opts.entry)
       }
     }
     yield chunk
